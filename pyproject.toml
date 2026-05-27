@@ -1,0 +1,86 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "home-llm"
+version = "0.1.0"
+description = "Private home LLM personal assistant — Apple Silicon"
+requires-python = ">=3.11"
+dependencies = [
+    # LLM + Orchestration
+    "langchain>=0.2.0",
+    "langchain-community>=0.2.0",
+    "langchain-ollama>=0.1.0",
+    "chromadb>=0.5.0",
+
+    # Audio
+    "faster-whisper>=1.0.0",
+    "sounddevice>=0.4.7",
+    "numpy>=1.26.0",
+    "scipy>=1.13.0",
+
+    # Speaker ID
+    "resemblyzer>=0.1.1",
+
+    # Config & Security
+    "pydantic>=2.7.0",
+    "pydantic-settings>=2.3.0",
+    "python-dotenv>=1.0.0",
+    "cryptography>=42.0.0",
+
+    # Logging & CLI
+    "structlog>=24.2.0",
+    "rich>=13.7.0",
+    "typer>=0.12.0",
+
+    # Integrations
+    "httpx>=0.27.0",
+    "google-auth>=2.30.0",
+    "google-auth-oauthlib>=1.2.0",
+    "google-api-python-client>=2.130.0",
+]
+
+[project.optional-dependencies]
+# Thai TTS via Kokoro (better quality than macOS say)
+tts-kokoro = [
+    "kokoro-onnx>=0.3.0",
+    "onnxruntime>=1.18.0",
+    "soundfile>=0.12.1",
+]
+# Wake word detection
+wake-word = [
+    "openwakeword>=0.6.0",
+]
+# Dev tools
+dev = [
+    "pytest>=8.2.0",
+    "pytest-asyncio>=0.23.0",
+    "ruff>=0.4.0",
+    "mypy>=1.10.0",
+]
+
+[project.scripts]
+home-llm       = "main:app"
+home-llm-enroll = "scripts.enroll:app"
+
+[tool.setuptools]
+py-modules = ["main"]
+
+[tool.setuptools.packages.find]
+include = ["config*", "core*", "services*", "tools*", "integrations*", "scripts*"]
+exclude = ["engine*", "utils*", "macros*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

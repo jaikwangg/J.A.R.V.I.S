@@ -1,6 +1,9 @@
 # Environment and secrets
 .env
 *.env
+credentials.json
+data/security/
+data/
 
 # Output files
 out/
