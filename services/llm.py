@@ -34,7 +34,6 @@ class LLMService:
             base_url=self._cfg.base_url,
             temperature=self._cfg.temperature,
             num_predict=self._cfg.max_tokens,
-            num_ctx=self._cfg.context_window,
             timeout=self._cfg.timeout,
         )
         log.info("llm_ready", model=self._cfg.model, base_url=self._cfg.base_url)

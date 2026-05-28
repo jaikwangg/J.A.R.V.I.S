@@ -38,7 +38,7 @@ def run_enrollment() -> None:
         security.clear_enrollment()
 
     console.print("\n[bold]🎤 ลงทะเบียนเสียงเจ้าของบ้าน[/bold]")
-    console.print("กรุณาพูดประโยคต่อไปนี้ให้ชัดเจน (ห้องเงียบ ไม่มีเสียงรบกวน)\n")
+    console.print("กรุณาพูดประโยคต่อไปนี้ให้ชัดเจน (ห้องเงียบ ไม่มีเสียง rambo รบกวน)\n")
 
     samples = []
     sentences = ENROLL_SENTENCES

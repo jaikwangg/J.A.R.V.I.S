@@ -1,125 +1,70 @@
 """
-Structured logging with rich console output and JSONL file logs.
+core/logger.py
+──────────────
+Structured logging — console (rich) + file (JSON Lines)
+ไม่ log audio content หรือ sensitive data เด็ดขาด
 """
 from __future__ import annotations
 
-import json
 import logging
-from datetime import datetime, timezone
+import sys
 from pathlib import Path
 from typing import Any
 
-try:
-    from rich.logging import RichHandler
-except Exception:  # pragma: no cover - rich is an optional runtime nicety
-    RichHandler = None  # type: ignore[assignment]
+import structlog
+from rich.console import Console
+from rich.logging import RichHandler
+
+_console = Console(stderr=True)
 
 
-_CONFIGURED = False
+def _drop_sensitive_fields(
+    logger: Any, method: str, event_dict: dict[str, Any]
+) -> dict[str, Any]:
+    """ลบ field ที่อาจมี sensitive data ก่อน log"""
+    for key in ("audio", "audio_data", "embedding", "raw_audio", "password", "token"):
+        event_dict.pop(key, None)
+    return event_dict
 
 
-def _json_default(value: Any) -> str:
-    if isinstance(value, Path):
-        return str(value)
-    return repr(value)
-
-
-class JsonLineFormatter(logging.Formatter):
-    """Format log records as one JSON object per line."""
-
-    def format(self, record: logging.LogRecord) -> str:
-        fields = getattr(record, "structured", {}) or {}
-        payload: dict[str, Any] = {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "level": record.levelname.lower(),
-            "logger": record.name,
-            "event": getattr(record, "event", record.getMessage()),
-        }
-        payload.update(fields)
-
-        if record.exc_info:
-            payload["exception"] = self.formatException(record.exc_info)
-
-        return json.dumps(payload, ensure_ascii=False, default=_json_default)
-
-
-class StructuredLogger:
-    """Small adapter that accepts structlog-style event + key fields."""
-
-    def __init__(self, name: str, bound: dict[str, Any] | None = None) -> None:
-        self._logger = logging.getLogger(name)
-        self._bound = bound or {}
-
-    def bind(self, **fields: Any) -> "StructuredLogger":
-        merged = {**self._bound, **fields}
-        return StructuredLogger(self._logger.name, merged)
-
-    def _log(self, level: int, event: str, **fields: Any) -> None:
-        exc_info = fields.pop("exc_info", None)
-        payload = {**self._bound, **fields}
-        self._logger.log(
-            level,
-            event,
-            extra={"event": event, "structured": payload},
-            exc_info=exc_info,
-        )
-
-    def debug(self, event: str, **fields: Any) -> None:
-        self._log(logging.DEBUG, event, **fields)
-
-    def info(self, event: str, **fields: Any) -> None:
-        self._log(logging.INFO, event, **fields)
-
-    def warning(self, event: str, **fields: Any) -> None:
-        self._log(logging.WARNING, event, **fields)
-
-    warn = warning
-
-    def error(self, event: str, **fields: Any) -> None:
-        self._log(logging.ERROR, event, **fields)
-
-    def exception(self, event: str, **fields: Any) -> None:
-        self._log(logging.ERROR, event, exc_info=True, **fields)
-
-
-def setup_logging(logs_dir: str | Path = "data/logs", debug: bool = False) -> None:
-    """Configure console and JSONL logging handlers."""
-    global _CONFIGURED
-
-    log_dir = Path(logs_dir)
+def setup_logging(log_dir: Path, debug: bool = False) -> None:
     log_dir.mkdir(parents=True, exist_ok=True)
+    log_file = log_dir / "home-llm.jsonl"
     level = logging.DEBUG if debug else logging.INFO
 
-    root = logging.getLogger()
-    root.handlers.clear()
-    root.setLevel(level)
+    file_handler = logging.FileHandler(log_file, encoding="utf-8")
+    file_handler.setLevel(level)
 
-    if RichHandler is not None:
-        console_handler: logging.Handler = RichHandler(
-            rich_tracebacks=debug,
-            show_path=False,
-            markup=True,
-        )
-    else:
-        console_handler = logging.StreamHandler()
-    console_handler.setLevel(level)
-    console_handler.setFormatter(logging.Formatter("%(message)s"))
-    root.addHandler(console_handler)
-
-    file_handler = logging.FileHandler(
-        log_dir / "home-llm.jsonl",
-        encoding="utf-8",
+    console_handler = RichHandler(
+        console=_console,
+        show_time=True,
+        show_path=debug,
+        rich_tracebacks=True,
+        markup=True,
     )
-    file_handler.setLevel(logging.DEBUG)
-    file_handler.setFormatter(JsonLineFormatter())
-    root.addHandler(file_handler)
+    console_handler.setLevel(level)
 
-    for noisy in ("httpx", "chromadb", "urllib3", "googleapiclient"):
-        logging.getLogger(noisy).setLevel(logging.WARNING)
+    logging.basicConfig(
+        level=level,
+        handlers=[console_handler, file_handler],
+        format="%(message)s",
+    )
 
-    _CONFIGURED = True
+    structlog.configure(
+        processors=[
+            structlog.contextvars.merge_contextvars,
+            _drop_sensitive_fields,
+            structlog.processors.add_log_level,
+            structlog.processors.TimeStamper(fmt="iso", utc=False),
+            structlog.processors.StackInfoRenderer(),
+            structlog.processors.ExceptionPrettyPrinter(),   # FIX: dict_tracebacks ไม่มีใน API
+            structlog.processors.JSONRenderer(),
+        ],
+        wrapper_class=structlog.make_filtering_bound_logger(level),
+        context_class=dict,
+        logger_factory=structlog.PrintLoggerFactory(file=sys.stderr),
+    )
 
 
-def get_logger(name: str) -> StructuredLogger:
-    """Return a structured logger."""
-    return StructuredLogger(name)
+def get_logger(name: str) -> structlog.BoundLogger:
+    return structlog.get_logger(name)

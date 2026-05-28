@@ -14,7 +14,7 @@ import typer
 from rich.console import Console
 from rich.panel import Panel
 
-from config.settings import settings
+from config.settings import Settings, settings
 from core.audio import AudioCapture
 from core.logger import get_logger, setup_logging
 from core.memory import MemoryManager
@@ -31,102 +31,78 @@ console = Console()
 app = typer.Typer(help="Home LLM Personal Assistant")
 
 
-# ── Assistant Core ────────────────────────────────────────────────────────
-
 class HomeAssistant:
-    def __init__(self) -> None:
+    def __init__(self, override_settings: Settings | None = None) -> None:
+        self._settings = override_settings or settings
+
         console.print(Panel(
-            f"[bold]🏠 {settings.assistant_name}[/bold] — Home LLM\n"
-            f"Model: [cyan]{settings.llm.model}[/cyan]  "
-            f"Lang: [cyan]{settings.language}[/cyan]  "
-            f"Debug: [cyan]{settings.debug}[/cyan]",
+            f"[bold]🏠 {self._settings.assistant_name}[/bold] — Home LLM\n"
+            f"Model: [cyan]{self._settings.llm_model}[/cyan]  "
+            f"Lang: [cyan]{self._settings.language}[/cyan]  "
+            f"Debug: [cyan]{self._settings.debug}[/cyan]",
             border_style="blue"
         ))
 
-        # Init components
-        self.audio    = AudioCapture(settings)
-        self.stt      = STTService(settings)
-        self.tts      = create_tts(settings)
-        self.security = SpeakerSecurity(settings)
-        self.memory   = MemoryManager(settings)
-        self.llm      = LLMService(settings)
-        self.tools    = get_all_tools(settings)
-        self.detector = WakeWordDetector(settings)
+        self.audio    = AudioCapture(self._settings)
+        self.stt      = STTService(self._settings)
+        self.tts      = create_tts(self._settings)
+        self.security = SpeakerSecurity(self._settings)
+        self.memory   = MemoryManager(self._settings)
+        self.llm      = LLMService(self._settings)
+        self.tools    = get_all_tools(self._settings)
+        self.detector = WakeWordDetector(self._settings)
 
-        self._active   = threading.Event()  # True = กำลังฟัง utterance
+        self._active   = threading.Event()
         self._shutdown = threading.Event()
 
-    # ── Health Check ──────────────────────────────────────────────────────
-
     def _check_health(self) -> bool:
-        """ตรวจสอบ Ollama ก่อนเริ่ม"""
         console.print("[yellow]⏳ เชื่อมต่อ Ollama...[/yellow]")
         if not self.llm.health_check():
             console.print(
                 "[red]❌ ไม่พบ Ollama หรือ model ที่ระบุ[/red]\n"
                 f"   รัน: [bold]ollama serve[/bold]  แล้ว  "
-                f"[bold]ollama pull {settings.llm.model}[/bold]"
+                f"[bold]ollama pull {self._settings.llm_model}[/bold]"
             )
             return False
-        console.print(f"[green]✅ Ollama พร้อม ({settings.llm.model})[/green]")
-
+        console.print(f"[green]✅ Ollama พร้อม ({self._settings.llm_model})[/green]")
         if not self.security.is_enrolled:
-            console.print(
-                "[yellow]⚠️  ยังไม่ได้ลงทะเบียนเสียง — รัน: home-llm enroll[/yellow]"
-            )
+            console.print("[yellow]⚠️  ยังไม่ได้ลงทะเบียนเสียง — รัน: python main.py enroll[/yellow]")
         return True
 
-    # ── Pipeline ──────────────────────────────────────────────────────────
-
     def _on_wake_word(self) -> None:
-        """Callback เมื่อ wake word ถูกตรวจพบ"""
         if self._active.is_set():
-            return  # กำลังประมวลผลอยู่
+            return
         self._active.set()
         threading.Thread(target=self._handle_turn, daemon=True).start()
 
     def _handle_turn(self) -> None:
-        """หนึ่ง turn ของการสนทนา"""
         try:
-            # 1. เล่นเสียงตอบรับ
             self.tts.speak("ครับ", blocking=False)
-
-            # 2. บันทึกเสียง
             console.print("[cyan]🎤 กำลังฟัง...[/cyan]")
             audio = self.audio.record_utterance(max_duration=20.0)
             if audio is None or len(audio) == 0:
-                log.debug("turn_no_audio")
                 return
 
-            # 3. ยืนยันเสียงเจ้าของบ้าน
             if not self.security.verify(audio):
                 console.print("[red]🔒 ไม่รู้จักเสียง[/red]")
                 self.tts.speak("ขออภัย ไม่รู้จักเสียงของคุณ")
                 return
 
-            # 4. STT
             text = self.stt.transcribe(audio)
             if not text:
-                log.debug("turn_empty_transcription")
                 return
             console.print(f"[white]👤 คุณ:[/white] {text}")
 
-            # 5. ค้นหา context จาก long-term memory
             context = self.memory.search_similar(text, n_results=2)
-
-            # 6. LLM
             history = self.memory.get_history()
+
             if self.tools:
                 reply = self.llm.chat_with_tools(text, self.tools, history)
             else:
                 reply = self.llm.chat(text, history, context)
 
-            console.print(f"[bold blue]🤖 {settings.assistant_name}:[/bold blue] {reply}")
-
-            # 7. TTS
+            console.print(f"[bold blue]🤖 {self._settings.assistant_name}:[/bold blue] {reply}")
             self.tts.speak(reply)
-
-            # 8. บันทึก memory
             self.memory.add(text, reply)
 
         except Exception as exc:
@@ -135,15 +111,11 @@ class HomeAssistant:
         finally:
             self._active.clear()
 
-    # ── Run ───────────────────────────────────────────────────────────────
-
-    def run(self) -> None:
-        """Main loop"""
+    def run(self, voice_mode: bool = True) -> None:
         if not self._check_health():
             sys.exit(1)
 
-        # Graceful shutdown
-        def _sig_handler(sig, frame):
+        def _sig_handler(sig: int, frame: object) -> None:
             console.print("\n[yellow]⏹ กำลังปิดระบบ...[/yellow]")
             self._shutdown.set()
             self.detector.stop()
@@ -153,17 +125,17 @@ class HomeAssistant:
         signal.signal(signal.SIGINT, _sig_handler)
         signal.signal(signal.SIGTERM, _sig_handler)
 
-        if settings.wake_word.enabled:
+        if voice_mode and self._settings.wake_word_enabled:
             console.print(
                 f"[green]👂 กำลังฟัง wake word: "
-                f"[bold]{settings.wake_word.phrase}[/bold][/green]"
+                f"[bold]{self._settings.wake_word_phrase}[/bold][/green]"
             )
-            self.tts.speak(f"{settings.assistant_name} พร้อมแล้วครับ", blocking=False)
+            self.tts.speak(f"{self._settings.assistant_name} พร้อมแล้วครับ", blocking=False)
             self.detector.start(on_detected=self._on_wake_word)
-            self._shutdown.wait()  # Block until Ctrl+C
+            self._shutdown.wait()
         else:
-            # Text mode (สำหรับ debug / ไม่มี mic)
-            console.print("[yellow]Wake word disabled — Text mode[/yellow]")
+            # Text mode — FIX: ไม่ mutate settings object อีกต่อไป
+            console.print("[yellow]Text mode — พิมพ์คำถาม หรือ 'quit' เพื่อออก[/yellow]")
             while not self._shutdown.is_set():
                 try:
                     text = input("You: ").strip()
@@ -174,22 +146,20 @@ class HomeAssistant:
                     history = self.memory.get_history()
                     context = self.memory.search_similar(text)
                     reply = self.llm.chat(text, history, context)
-                    console.print(f"[bold blue]{settings.assistant_name}:[/bold blue] {reply}")
+                    console.print(f"[bold blue]{self._settings.assistant_name}:[/bold blue] {reply}")
                     self.memory.add(text, reply)
                 except (EOFError, KeyboardInterrupt):
                     break
 
 
-# ── CLI Commands ──────────────────────────────────────────────────────────
+# ── CLI ───────────────────────────────────────────────────────────────────
 
 @app.command()
 def start(
-    text_mode: bool = typer.Option(False, "--text", "-t", help="ใช้ text mode แทน voice"),
+    text: bool = typer.Option(False, "--text", "-t", help="ใช้ text mode แทน voice"),
 ) -> None:
     """เริ่ม Home Assistant"""
-    if text_mode:
-        settings.wake_word.enabled = False
-    HomeAssistant().run()
+    HomeAssistant().run(voice_mode=not text)
 
 
 @app.command()
@@ -203,6 +173,9 @@ def enroll() -> None:
 def devices() -> None:
     """แสดง microphone ที่มีทั้งหมด"""
     mics = AudioCapture.list_devices()
+    if not mics:
+        console.print("[yellow]ไม่พบ microphone[/yellow]")
+        return
     for m in mics:
         console.print(f"  [{m['index']}] {m['name']}")
 

@@ -2,7 +2,7 @@
 core/memory.py
 ──────────────
 Dual-layer memory
-- Short-term : ConversationBufferWindowMemory (in-RAM, last N turns)
+- Short-term : simple list (in-RAM, last N turns) — ไม่พึ่ง langchain.memory deprecated path
 - Long-term  : ChromaDB vector store (persistent, semantic search)
 """
 from __future__ import annotations
@@ -19,9 +19,9 @@ from core.logger import get_logger
 log = get_logger(__name__)
 
 
-class MemoryEntry(NamedTuple):
-    role: str          # "user" | "assistant"
-    content: str
+class Turn(NamedTuple):
+    user: str
+    assistant: str
     timestamp: str
 
 
@@ -29,16 +29,14 @@ class MemoryManager:
     """จัดการ memory ทั้ง short-term และ long-term"""
 
     def __init__(self, settings: Settings) -> None:
-        self._cfg = settings.memory
+        self._max = settings.memory_max_history
 
-        # Short-term: เก็บ N turn ล่าสุดใน RAM
-        self._short_term: deque[MemoryEntry] = deque(
-            maxlen=self._cfg.max_history * 2
-        )
+        # Short-term: deque ง่ายๆ ใน RAM ไม่พึ่ง langchain deprecated class
+        self._turns: deque[Turn] = deque(maxlen=self._max)
 
-        # Long-term: ChromaDB บน disk (persist ข้าม session)
+        # Long-term: ChromaDB บน disk
         self._chroma = chromadb.PersistentClient(
-            path=str(self._cfg.persist_dir)
+            path=str(settings.memory_persist_dir)
         )
         self._collection = self._chroma.get_or_create_collection(
             name="conversations",
@@ -48,45 +46,42 @@ class MemoryManager:
         log.info(
             "memory_ready",
             long_term_entries=self._collection.count(),
-            short_term_window=self._cfg.max_history,
+            short_term_window=self._max,
         )
 
     # ── Add ───────────────────────────────────────────────────────────────
 
     def add(self, user_msg: str, assistant_msg: str) -> None:
-        """บันทึก turn ใหม่ลงทั้ง short-term และ long-term"""
         ts = datetime.now().isoformat()
+        self._turns.append(Turn(user=user_msg, assistant=assistant_msg, timestamp=ts))
 
-        # Short-term
-        self._short_term.append(MemoryEntry("user", user_msg, ts))
-        self._short_term.append(MemoryEntry("assistant", assistant_msg, ts))
-
-        # Long-term (เก็บเป็น document คู่)
+        # Long-term
         self._collection.add(
             documents=[f"User: {user_msg}\nAssistant: {assistant_msg}"],
-            metadatas=[{"timestamp": ts, "user": user_msg[:100]}],
+            metadatas=[{"timestamp": ts, "user_preview": user_msg[:100]}],
             ids=[ts],
         )
-
         log.debug("memory_added", ts=ts)
 
     # ── Query ─────────────────────────────────────────────────────────────
 
     def get_history(self) -> list[dict[str, str]]:
-        """Short-term history สำหรับใส่ใน LLM context"""
-        return [
-            {"role": entry.role, "content": entry.content}
-            for entry in self._short_term
-        ]
+        """Short-term history รูปแบบ [{"role": ..., "content": ...}]"""
+        result = []
+        for turn in self._turns:
+            result.append({"role": "user", "content": turn.user})
+            result.append({"role": "assistant", "content": turn.assistant})
+        return result
 
     def search_similar(self, query: str, n_results: int = 3) -> list[str]:
         """ค้นหา conversation ที่เกี่ยวข้องใน long-term memory"""
-        if self._collection.count() == 0:
+        count = self._collection.count()
+        if count == 0:
             return []
         try:
             results = self._collection.query(
                 query_texts=[query],
-                n_results=min(n_results, self._collection.count()),
+                n_results=min(n_results, count),
             )
             docs: list[str] = results["documents"][0] if results["documents"] else []
             log.debug("memory_search", query=query[:50], found=len(docs))
@@ -96,8 +91,7 @@ class MemoryManager:
             return []
 
     def clear_short_term(self) -> None:
-        """ล้าง short-term memory (เริ่ม conversation ใหม่)"""
-        self._short_term.clear()
+        self._turns.clear()
         log.info("short_term_memory_cleared")
 
     @property
