@@ -1,10 +1,8 @@
 """
-services/llm.py
-───────────────
-LLM service ผ่าน Ollama (local, no internet)
-- รองรับ tool calling ผ่าน LangChain agent
-- inject memory history ใน context window
-- retry + timeout ป้องกัน hang
+services/llm.py — LLM service ผ่าน Ollama (local, no internet)
+
+FIX-F: เพิ่ม summarize() method ที่ไม่ inject system prompt assistant persona
+       เพื่อให้ memory._maybe_summarize() เรียกใช้ได้ถูกต้อง
 """
 from __future__ import annotations
 
@@ -24,42 +22,35 @@ log = get_logger(__name__)
 
 
 class LLMService:
-    """Wrapper รอบ Ollama LLM"""
-
     def __init__(self, settings: Settings) -> None:
-        self._cfg = settings.llm
         self._settings = settings
         self._llm = ChatOllama(
-            model=self._cfg.model,
-            base_url=self._cfg.base_url,
-            temperature=self._cfg.temperature,
-            num_predict=self._cfg.max_tokens,
-            timeout=self._cfg.timeout,
+            model=settings.llm_model,
+            base_url=settings.llm_base_url,
+            temperature=settings.llm_temperature,
+            num_predict=settings.llm_max_tokens,
+            timeout=settings.llm_timeout,
         )
-        log.info("llm_ready", model=self._cfg.model, base_url=self._cfg.base_url)
+        log.info("llm_ready", model=settings.llm_model, base_url=settings.llm_base_url)
 
-    # ── Connectivity Check ────────────────────────────────────────────────
+    # ── Health ────────────────────────────────────────────────────────────
 
     def health_check(self) -> bool:
-        """เช็คว่า Ollama รันอยู่และ model พร้อมใช้"""
         try:
             import httpx
-            r = httpx.get(f"{self._cfg.base_url}/api/tags", timeout=5)
+            r = httpx.get(f"{self._settings.llm_base_url}/api/tags", timeout=5)
             models = [m["name"] for m in r.json().get("models", [])]
-            base = self._cfg.model.split(":")[0]
+            base = self._settings.llm_model.split(":")[0]
             ok = any(base in m for m in models)
             if not ok:
-                log.warning(
-                    "llm_model_not_found",
-                    model=self._cfg.model,
-                    available=models,
-                )
+                log.warning("llm_model_not_found", model=self._settings.llm_model,
+                            available=models)
             return ok
         except Exception as exc:
             log.error("llm_health_check_failed", error=str(exc))
             return False
 
-    # ── Chat ──────────────────────────────────────────────────────────────
+    # ── Chat (with assistant persona + system prompt) ─────────────────────
 
     def chat(
         self,
@@ -67,50 +58,65 @@ class LLMService:
         history: list[dict[str, str]] | None = None,
         context: list[str] | None = None,
     ) -> str:
-        """
-        ส่งข้อความและรับการตอบกลับ
-        history : list ของ {"role": "user"|"assistant", "content": "..."}
-        context : relevant memories จาก long-term store
-        """
-        messages = []
+        """ตอบโต้ปกติ — inject system prompt assistant persona เสมอ"""
+        messages: list = []
 
-        # System prompt
         system_text = get_system_prompt(
             name=self._settings.assistant_name,
             language=self._settings.language,
         )
-        # ถ้ามี context จาก long-term memory ให้เพิ่มเข้าไป
         if context:
-            context_block = "\n\nข้อมูลจากความทรงจำที่อาจเกี่ยวข้อง:\n"
-            context_block += "\n".join(f"- {c}" for c in context[:3])
-            system_text += context_block
+            system_text += "\n\nข้อมูลจากความทรงจำที่อาจเกี่ยวข้อง:\n"
+            system_text += "\n".join(f"- {c}" for c in context[:3])
 
         messages.append(SystemMessage(content=system_text))
 
-        # History
         for msg in (history or []):
-            if msg["role"] == "user":
-                messages.append(HumanMessage(content=msg["content"]))
-            else:
-                messages.append(AIMessage(content=msg["content"]))
+            role = msg.get("role", "")
+            content = msg.get("content", "")
+            if role == "user":
+                messages.append(HumanMessage(content=content))
+            elif role == "assistant":
+                messages.append(AIMessage(content=content))
+            # role == "system" → skip (already in system_text)
 
-        # Current message
         messages.append(HumanMessage(content=user_message))
 
         try:
             response = self._llm.invoke(messages)
             reply = str(response.content).strip()
-            log.debug(
-                "llm_response",
-                input_chars=len(user_message),
-                output_chars=len(reply),
-            )
+            log.debug("llm_response", input_chars=len(user_message), output_chars=len(reply))
             return reply
         except Exception as exc:
             log.error("llm_invoke_failed", error=str(exc))
             return "ขออภัยครับ เกิดข้อผิดพลาดในการประมวลผล กรุณาลองใหม่อีกครั้ง"
 
-    # ── With Tools ────────────────────────────────────────────────────────
+    # ── Summarize (FIX-F: neutral — no assistant persona) ─────────────────
+
+    def summarize(self, text: str) -> str:
+        """
+        เรียกใช้ LLM แบบ neutral ไม่ inject system prompt assistant persona
+        ใช้สำหรับ: memory summarization, document processing
+        Returns: summarized text หรือ fallback string
+        """
+        messages = [
+            SystemMessage(content=(
+                "คุณเป็น summarizer ที่เป็นกลาง "
+                "สรุปข้อความที่รับมาให้กระชับ ตรงประเด็น "
+                "ห้ามแต่งเนื้อหาเพิ่ม ห้ามตอบในฐานะ assistant"
+            )),
+            HumanMessage(content=text),
+        ]
+        try:
+            response = self._llm.invoke(messages)
+            result = str(response.content).strip()
+            log.debug("llm_summarize", input_chars=len(text), output_chars=len(result))
+            return result
+        except Exception as exc:
+            log.error("llm_summarize_failed", error=str(exc))
+            return ""
+
+    # ── Chat with tools (LangChain agent) ────────────────────────────────
 
     def chat_with_tools(
         self,
@@ -118,7 +124,6 @@ class LLMService:
         tools: list["BaseTool"],
         history: list[dict[str, str]] | None = None,
     ) -> str:
-        """ใช้ LangChain agent เมื่อต้องการ tool calling"""
         from langchain.agents import AgentExecutor, create_tool_calling_agent
         from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 
@@ -126,7 +131,6 @@ class LLMService:
             name=self._settings.assistant_name,
             language=self._settings.language,
         )
-
         prompt = ChatPromptTemplate.from_messages([
             ("system", system_text),
             MessagesPlaceholder("chat_history", optional=True),
@@ -144,11 +148,12 @@ class LLMService:
             handle_parsing_errors=True,
         )
 
-        chat_history = []
+        chat_history: list = []
         for msg in (history or []):
-            if msg["role"] == "user":
+            role = msg.get("role", "")
+            if role == "user":
                 chat_history.append(HumanMessage(content=msg["content"]))
-            else:
+            elif role == "assistant":
                 chat_history.append(AIMessage(content=msg["content"]))
 
         try:
